@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+device = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
 
 class RNN_BN(nn.Module):
     """
@@ -272,7 +272,7 @@ class loss_exp_OCE(nn.Module):
     def forward(self,
                 holding, 
                 price,
-                mode='test'
+                p0=None
                ):
         delta_price = price[:, 1:] - price[:, :-1]
         PnL = (holding * delta_price).sum(dim=1)
@@ -284,6 +284,8 @@ class loss_exp_OCE(nn.Module):
             self.p0 = (torch.exp(-self.lamb * X).mean().log()/self.lamb).item()+np.log(self.lamb)/self.lamb
         elif self.p0_mode == 'train':
             pass
+        elif self.p0_mode == 'given':
+            self.p0 = p0
 
         loss = self.exp_utility(X+self.p0)
         return loss

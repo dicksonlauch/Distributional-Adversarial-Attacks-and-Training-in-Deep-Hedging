@@ -6,7 +6,7 @@ import argparse
 import time
 from BS_util import *
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
 print(f"running on {device}")
 
 def epoch_att_loader(loader,attacker, network, loss_fn, delta, alpha1=1., alpha2=1,opt=None):

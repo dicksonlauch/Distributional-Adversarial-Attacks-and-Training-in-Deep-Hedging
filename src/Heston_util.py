@@ -3,7 +3,7 @@ import torch.nn as nn
 import numpy as np
 
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
 
 class PathGeneratorHeston(nn.Module):
     def __init__(self, s0, v0, alpha, b, sigma, rho, timestep, T):
@@ -264,7 +264,7 @@ class RNN_BN(nn.Module):
 class RNN_BN_simple(nn.Module):
     def __init__(self,
                  sequence_length,
-                 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                 device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
                  ):
         super(RNN_BN_simple, self).__init__()
         self.sequnce_length = sequence_length
