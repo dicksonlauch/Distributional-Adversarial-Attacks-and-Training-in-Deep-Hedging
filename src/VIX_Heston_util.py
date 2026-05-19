@@ -239,6 +239,57 @@ def find_optimal_p0(X_total, loss_alpha=0.5, tolerance=1e-4):
     return X_total.quantile(loss_alpha).item()
 
 
+class loss_Entropic_VIX(nn.Module):
+    """
+    Entropic Risk (Exponential Utility) Loss for VIX Deep Hedging.
+    Penalizes portfolio variance to enforce pure liability replication.
+    """
+    def __init__(self, Strike_price, risk_aversion=0.01, trans_cost_rate=0.):
+        super(loss_Entropic_VIX, self).__init__()
+        self.K = Strike_price
+        self.lambd = risk_aversion
+        self.transaction_cost_rate = trans_cost_rate
+
+    def terminal_payoff(self, final_price):
+        return torch.max(final_price - self.K, torch.zeros_like(final_price))
+
+    def forward(self, holding, S, F1, VIX, output_hedging_error=False, p0=None):
+        # p0 is accepted purely for compatibility with your old training loops, 
+        # but Entropic Risk does not use a VaR threshold.
+        
+        # 1. Price changes
+        delta_S = S[:, 1:] - S[:, :-1]      
+        
+        # 2. Daily Roll Yield (Theta) to prevent constant-maturity arbitrage
+        daily_roll_yield = (VIX[:, :-1] - F1[:, :-1]) * (1.0 / 30.0)
+        true_delta_F1 = (F1[:, 1:] - F1[:, :-1]) + daily_roll_yield
+
+        # Stack: (N, T, 2)
+        delta_price = torch.stack([delta_S, true_delta_F1], dim=-1)
+
+        # 3. PnL = sum over time and instruments
+        PnL = (holding * delta_price).sum(dim=(1, 2))  # (N,)
+
+        # 4. Option Liability & Hedging Error (X)
+        C_T = self.terminal_payoff(S[:, -1])
+        X = C_T - PnL
+
+        # 5. Transaction costs (with 5x multiplier for VIX futures)
+        if self.transaction_cost_rate > 0:
+            price_levels = torch.stack([S[:, :-1], F1[:, :-1] * 5.0], dim=-1)
+            delta_holding = torch.diff(holding, dim=1, prepend=holding[:, :1])
+            tc = (delta_holding.abs() * self.transaction_cost_rate * price_levels).sum(dim=(1, 2))
+            X = X + tc
+
+        # 6. Entropic Risk Measure: (1/lambda) * ln( E[ exp(lambda * X) ] )
+        # Numerical stability trick: factor out the max value to prevent float32 overflow
+        max_X = torch.max(X).detach()
+        loss = max_X + (1.0 / self.lambd) * torch.log(torch.mean(torch.exp(self.lambd * (X - max_X))))
+
+        if output_hedging_error:
+            return loss, X.mean()
+        return loss
+
 class loss_CVAR_VIX(nn.Module):
     """
     CVaR loss function for hedging with 2 instruments: equity (S),
@@ -261,7 +312,7 @@ class loss_CVAR_VIX(nn.Module):
         self.transaction_cost_rate = trans_cost_rate
 
     def terminal_payoff(self, final_price):
-        return torch.max(self.K - final_price, torch.zeros_like(final_price))
+        return torch.max(final_price - self.K, torch.zeros_like(final_price))
 
     def forward(self, holding, S, F1, VIX,
                 output_hedging_error=False, p0=None):
@@ -421,3 +472,53 @@ class VIX_Heston_Attacker():
 
         S_att = S + att_best
         return S_att, VIX, F1
+
+
+class loss_MSE_VIX(nn.Module):
+    """
+    Mean Squared Hedging Error for VIX Deep Hedging.
+    Forces the agent to act strictly as a hedger, heavily penalizing 
+    ANY deviation (profit or loss) from the option liability.
+    """
+    def __init__(self, Strike_price, trans_cost_rate=0.):
+        super(loss_MSE_VIX, self).__init__()
+        self.K = Strike_price
+        self.tc_rate = trans_cost_rate
+        # p0 represents the initial option premium collected
+        self.p0 = nn.Parameter(torch.tensor(1.69))
+
+    def terminal_payoff(self, final_price):
+        return torch.max(final_price - self.K, torch.zeros_like(final_price))
+
+    def forward(self, holding, S, F1, VIX):
+        # 1. Price Changes & Structural Roll Yield
+        delta_S = S[:, 1:] - S[:, :-1]
+        delta_F1_constant = F1[:, 1:] - F1[:, :-1]
+        
+        daily_roll_yield = (VIX[:, :-1] - F1[:, :-1]) * (1.0 / 30.0)
+        true_delta_F1 = delta_F1_constant + daily_roll_yield
+        
+        delta_price = torch.stack([delta_S, true_delta_F1], dim=-1)
+        
+        # 2. PnL & Liability
+        PnL = (holding * delta_price).sum(dim=(1, 2))
+        C_T = self.terminal_payoff(S[:, -1])
+        
+        # X represents the raw hedging shortfall (Liability - PnL)
+        X = C_T - PnL
+        
+        # 3. Transaction Costs
+        if self.tc_rate > 0:
+            price_levels = torch.stack([S[:, :-1], F1[:, :-1] * 5.0], dim=-1)
+            delta_holding = torch.diff(holding, dim=1, prepend=holding[:, :1])
+            tc = (delta_holding.abs() * self.tc_rate * price_levels).sum(dim=(1, 2))
+            X = X + tc  # Friction increases the shortfall
+            
+        # 4. Mean Squared Error
+        # We want: Initial Premium (p0) + PnL - Costs = Liability (C_T)
+        # Rearranged: p0 - X = 0
+        # The agent minimizes the squared distance from perfect replication
+        loss = torch.mean((X - self.p0) ** 2)
+        
+        return loss
+

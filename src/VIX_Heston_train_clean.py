@@ -21,16 +21,18 @@ def alpha_learning_rate(epoch):
         return 0.001
 
 
-def epoch_loader(loader, network, loss_fn, K, T, dt, sequence_length, opt=None):
+def epoch_loader(loader, network, loss_fn, K, T, dt, sequence_length, opt=None, loss_type="mse", p0_clean=None):
     """
     Runs one epoch of clean training for VIX hedging.
 
     Args:
         loader: DataLoader providing batches of (S, V, VIX, F1).
         network: VIX hedging network.
-        loss_fn: CVaR loss function.
+        loss_fn: Loss function.
         K, T, dt, sequence_length: model parameters for feature construction.
         opt: Optimizer (if training, None for evaluation).
+        loss_type: Type of loss function ("mse", "cvar", "entropic").
+        p0_clean: Learnable p0 parameter for CVaR loss.
 
     Returns:
         Average loss for the epoch.
@@ -43,11 +45,15 @@ def epoch_loader(loader, network, loss_fn, K, T, dt, sequence_length, opt=None):
         # Construct input features
         features = construct_features(S, VIX, F1, K, T, dt, sequence_length)
         holding = network(features)
-        loss = loss_fn(holding, S, F1, VIX, p0=p0_clean)
+        if loss_type == "cvar":
+            loss = loss_fn(holding, S, F1, VIX, p0=p0_clean)
+        else:
+            loss = loss_fn(holding, S, F1, VIX)
 
         if opt:
             opt.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(network.parameters(), max_norm=1.0)
             opt.step()
         total_loss += loss.item()
     total_loss /= len(loader)
@@ -70,14 +76,17 @@ parser = argparse.ArgumentParser(description="VIX Heston clean training.")
 parser.add_argument("--N", type=int, default=10000, help="number of samples.")
 parser.add_argument("--transaction_cost_rate", type=float, default=0.0,
                     help="transaction cost rate.")
+parser.add_argument("--loss_type", type=str, default="mse", choices=["cvar", "entropic", "mse"], 
+                    help="Type of loss function to use.")
 args = parser.parse_args()
 args_dict = vars(args)
 print(args_dict)
 N = args.N
 T = dt * sequence_length
 transaction_cost_rate = args.transaction_cost_rate
+loss_type = args.loss_type
 
-name = f"VIX_HestonClean_N{N:.0e}_tran{transaction_cost_rate:.0e}".replace("+0", "").replace("-0", "-")
+name = f"VIX_HestonClean_{loss_type}_N{N:.0e}_tran{transaction_cost_rate:.0e}".replace("+0", "").replace("-0", "-")
 
 # Load training data: (S, V, VIX, F1)
 data_train = torch.load('../Data/VIX_Heston_train.pt')
@@ -103,16 +112,31 @@ for part in range(0, int(1e5 / N)):
         input_size=6, output_size=2, hidden_size=64
     ).to(device)
 
-    loss_fn = loss_CVAR_VIX(
-        Strike_price=K, alpha_loss=alpha_loss,
-        trans_cost_rate=transaction_cost_rate, p0_mode='given'
-    ).to(device)
-
+    # Setup loss function and parameters to optimize
     p0_clean = nn.Parameter(torch.tensor(1.69))
-    opt = torch.optim.Adam([
-        {'params': network.parameters()},
-        {'params': [p0_clean]}
-    ], lr=learning_rate)
+    params = [{'params': network.parameters()}]
+
+    if loss_type == "mse":
+        loss_fn = loss_MSE_VIX(
+            Strike_price=K, 
+            trans_cost_rate=transaction_cost_rate
+        ).to(device)
+        params.append({'params': [loss_fn.p0]})
+        
+    elif loss_type == "cvar":
+        loss_fn = loss_CVAR_VIX(
+            Strike_price=K, alpha_loss=alpha_loss,
+            trans_cost_rate=transaction_cost_rate, p0_mode='given'
+        ).to(device) 
+        params.append({'params': [p0_clean]})
+        
+    elif loss_type == "entropic":
+        loss_fn = loss_Entropic_VIX(
+            Strike_price=K, trans_cost_rate=transaction_cost_rate
+        ).to(device)
+        # Entropic does not optimize p0
+
+    opt = torch.optim.Adam(params, lr=learning_rate)
     LR_scheduler = torch.optim.lr_scheduler.LambdaLR(
         opt, lr_lambda=alpha_learning_rate)
 
@@ -122,10 +146,20 @@ for part in range(0, int(1e5 / N)):
         time1 = time.time()
         network.train()
         train_result = epoch_loader(
-            train_loader, network, loss_fn, K, T, dt, sequence_length, opt=opt)
+            train_loader, network, loss_fn, K, T, dt, sequence_length, opt=opt,
+            loss_type=loss_type, p0_clean=p0_clean if loss_type == "cvar" else None
+        )
         time2 = time.time()
+        
+        if loss_type == "mse":
+            p0_val = loss_fn.p0.item()
+        elif loss_type == "cvar":
+            p0_val = p0_clean.item()
+        else:
+            p0_val = 0.0 # Entropic does not optimize p0
+
         print(f"epoch {i}, train loss: {train_result:.6f}, "
-              f"time: {time2 - time1:.1f}s, p0: {p0_clean.item():.4f}")
+              f"time: {time2 - time1:.1f}s, p0: {p0_val:.4f}")
         LR_scheduler.step()
 
     # Save trained network
