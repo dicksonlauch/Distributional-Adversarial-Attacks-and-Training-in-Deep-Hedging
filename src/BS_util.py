@@ -244,7 +244,8 @@ class loss_exp_OCE(nn.Module):
                     T,
                  lamb,
                  X_max=False,
-                p0_mode='train'
+                p0_mode='train',
+                option_type='call'
                  ):
         super(loss_exp_OCE, self).__init__()
         self.K = Strike_price
@@ -257,7 +258,10 @@ class loss_exp_OCE(nn.Module):
         else:
             self.p0 = 1.96
         self.p0_mode = p0_mode
+        self.option_type = option_type.lower()
     def terminal_payoff(self, final_price):
+        if self.option_type == 'put':
+            return torch.max(self.K - final_price, torch.zeros_like(final_price))
         return torch.max(final_price - self.K, torch.zeros_like(final_price))
     
     def exp_utility(self, x):
@@ -266,6 +270,9 @@ class loss_exp_OCE(nn.Module):
     def p0_fn(self, X):
         d1 = (torch.log(X / self.K) + (0.5 * self.vol ** 2) * self.T) / (self.vol * self.T**0.5)
         d2 = d1 - self.vol * self.T**0.5
+        if self.option_type == 'put':
+            put_price = self.K * torch.distributions.Normal(0, 1).cdf(-d2) - X * torch.distributions.Normal(0, 1).cdf(-d1)
+            return put_price
         call_price = X * torch.distributions.Normal(0, 1).cdf(d1) - self.K * torch.distributions.Normal(0, 1).cdf(d2)
         return call_price
     

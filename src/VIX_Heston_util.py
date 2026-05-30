@@ -23,7 +23,8 @@ class VIXHestonPathGenerator(PathGeneratorHeston):
     computed via numerical quadrature over the non-central chi-squared
     distribution of V_{t+tau_fut} | v_t.
 
-    Fixed tenors: F1 has tau_fut1=30/365.
+    F1 represents a VIX future that expires on the same date as the option (at time T),
+    meaning its time-to-maturity (tau_fut) decreases dynamically from T to 0 along the path.
     """
     def __init__(self, s0, v0, alpha, b, sigma, rho, timestep, T,
                  tau_vix=30/365, tau_fut1=30/365):
@@ -56,7 +57,15 @@ class VIXHestonPathGenerator(PathGeneratorHeston):
             pdf_val = stats.ncx2.pdf(y, d, lam)
             return np.sqrt(self.a_vix * c * y + self.b_vix) * pdf_val
 
-        result, _ = integrate.quad(integrand, 0, np.inf, limit=200)
+        # Provide tight bounds around the peak for numerical stability 
+        # when tau_fut is very small (otherwise quad misses the spike and returns 0)
+        mean_y = d + lam
+        std_y = np.sqrt(2 * (d + 2 * lam))
+        
+        lower_bound = max(0, mean_y - 10 * std_y)
+        upper_bound = mean_y + 10 * std_y
+
+        result, _ = integrate.quad(integrand, lower_bound, upper_bound, limit=200)
         return 100 * result
 
     def _precompute_futures_tables(self, n_grid=1000):
@@ -66,10 +75,19 @@ class VIXHestonPathGenerator(PathGeneratorHeston):
         """
         self.v_grid = np.linspace(1e-4, 3.0, n_grid)
 
-        print("Precomputing VIX futures lookup table (F1)...")
-        self.F1_grid = np.array([
-            self._vix_futures_price_scalar(v, self.tau_fut1) for v in self.v_grid
-        ])
+        print("Precomputing VIX futures lookup table (F1) with decreasing DTM...")
+        dt = self.T / self.timestep
+        self.F1_grids = []
+        for i in range(self.timestep + 1):
+            tau_fut = self.T - i * dt
+            if tau_fut <= 1e-6:
+                # At maturity, future equals VIX spot
+                f1_vals = [100 * np.sqrt(self.a_vix * v + self.b_vix) for v in self.v_grid]
+            else:
+                f1_vals = [self._vix_futures_price_scalar(v, tau_fut) for v in self.v_grid]
+            self.F1_grids.append(np.array(f1_vals))
+            
+        self.F1_grid = np.stack(self.F1_grids, axis=0)
         print("VIX futures lookup tables ready.")
 
     def compute_vix_spot(self, V):
@@ -89,7 +107,9 @@ class VIXHestonPathGenerator(PathGeneratorHeston):
         Returns: F1 of same shape
         """
         V_np = V if isinstance(V, np.ndarray) else V.numpy()
-        F1 = np.interp(V_np.ravel(), self.v_grid, self.F1_grid).reshape(V_np.shape)
+        F1 = np.zeros_like(V_np)
+        for i in range(V_np.shape[1]):
+            F1[:, i] = np.interp(V_np[:, i], self.v_grid, self.F1_grid[i])
         return F1
 
     def generate(self, sample_size):
@@ -118,7 +138,7 @@ def construct_features(S, VIX, F1, K, T, dt, sequence_length):
         2: ln(VIX_t / VIX_{t-1}) — VIX log-return (0 at t=0)
         3: ln(F1_t / F1_{t-1})   — front-month return (0 at t=0)
         4: tau_opt               — remaining time to option maturity
-        5: tau_fut1              — time to futures maturity (constant for fixed tenor)
+        5: tau_fut               — time to futures maturity (decreasing dynamically to 0)
 
     Args:
         S, VIX, F1: tensors of shape (N, T+1)
@@ -153,8 +173,8 @@ def construct_features(S, VIX, F1, K, T, dt, sequence_length):
     # Feature 4: remaining time to option maturity
     tau_opt = (T - dt * torch.arange(sequence_length, device=S.device)).unsqueeze(0).expand(N, -1)
 
-    # Feature 5: time to futures maturity (constant for fixed tenor)
-    tau_fut = torch.full((N, sequence_length), 30/365, device=S.device)
+    # Feature 5: time to futures maturity (decreasing to 0 at option maturity)
+    tau_fut = tau_opt.clone()
 
     # Stack: (N, T, 6)
     features = torch.stack([
@@ -244,13 +264,16 @@ class loss_Entropic_VIX(nn.Module):
     Entropic Risk (Exponential Utility) Loss for VIX Deep Hedging.
     Penalizes portfolio variance to enforce pure liability replication.
     """
-    def __init__(self, Strike_price, risk_aversion=0.01, trans_cost_rate=0.):
+    def __init__(self, Strike_price, risk_aversion=0.01, trans_cost_rate=0., option_type='call'):
         super(loss_Entropic_VIX, self).__init__()
         self.K = Strike_price
         self.lambd = risk_aversion
         self.transaction_cost_rate = trans_cost_rate
+        self.option_type = option_type.lower()
 
     def terminal_payoff(self, final_price):
+        if self.option_type == 'put':
+            return torch.max(self.K - final_price, torch.zeros_like(final_price))
         return torch.max(final_price - self.K, torch.zeros_like(final_price))
 
     def forward(self, holding, S, F1, VIX, output_hedging_error=False, p0=None):
@@ -260,9 +283,8 @@ class loss_Entropic_VIX(nn.Module):
         # 1. Price changes
         delta_S = S[:, 1:] - S[:, :-1]      
         
-        # 2. Daily Roll Yield (Theta) to prevent constant-maturity arbitrage
-        daily_roll_yield = (VIX[:, :-1] - F1[:, :-1]) * (1.0 / 30.0)
-        true_delta_F1 = (F1[:, 1:] - F1[:, :-1]) + daily_roll_yield
+        # 2. Assume VIX future expires on the same date as the option
+        true_delta_F1 = F1[:, 1:] - F1[:, :-1]
 
         # Stack: (N, T, 2)
         delta_price = torch.stack([delta_S, true_delta_F1], dim=-1)
@@ -300,7 +322,7 @@ class loss_CVAR_VIX(nn.Module):
     Loss = CVaR_alpha(X)
     """
     def __init__(self, Strike_price, alpha_loss=0.5,
-                 p0_mode='search', trans_cost_rate=0.):
+                 p0_mode='search', trans_cost_rate=0., option_type='call'):
         super(loss_CVAR_VIX, self).__init__()
         self.K = Strike_price
         self.alpha = alpha_loss
@@ -310,8 +332,11 @@ class loss_CVAR_VIX(nn.Module):
             self.p0 = 1.96
         self.p0_mode = p0_mode
         self.transaction_cost_rate = trans_cost_rate
+        self.option_type = option_type.lower()
 
     def terminal_payoff(self, final_price):
+        if self.option_type == 'put':
+            return torch.max(self.K - final_price, torch.zeros_like(final_price))
         return torch.max(final_price - self.K, torch.zeros_like(final_price))
 
     def forward(self, holding, S, F1, VIX,
@@ -329,9 +354,8 @@ class loss_CVAR_VIX(nn.Module):
         delta_S = S[:, 1:] - S[:, :-1]      # (N, T)
         delta_F1 = F1[:, 1:] - F1[:, :-1]
 
-        daily_roll_yield = (VIX[:, :-1] - F1[:, :-1]) * (1.0 / 30.0)
-
-        true_delta_F1 = delta_F1 + daily_roll_yield
+        # Assume VIX future expires on the same date as the option
+        true_delta_F1 = delta_F1
 
         # Stack: (N, T, 2)
         delta_price = torch.stack([delta_S, true_delta_F1], dim=-1)
@@ -393,7 +417,7 @@ class VIX_Heston_Attacker():
         features = construct_features(S, VIX, F1,
                                       self.K, self.T, self.dt, self.sequence_length)
         holding = network(features)
-        loss = self.loss_fn(holding, S, F1)
+        loss = self.loss_fn(holding, S, F1, VIX)
         return loss.item()
 
     def S_budget_attack(self, network, S, VIX, F1, delta, ratio, n_iter):
@@ -440,7 +464,7 @@ class VIX_Heston_Attacker():
             features = construct_features(S_att, VIX, F1,
                                           self.K, self.T, self.dt, self.sequence_length)
             holding = network(features)
-            loss = self.loss_fn(holding, S_att, F1)
+            loss = self.loss_fn(holding, S_att, F1, VIX)
 
             if loss.item() > result_best:
                 att_best = (budget.unsqueeze(1) * att_sign).clone().detach()
@@ -466,7 +490,7 @@ class VIX_Heston_Attacker():
         features = construct_features(S_att, VIX, F1,
                                       self.K, self.T, self.dt, self.sequence_length)
         holding = network(features)
-        loss = self.loss_fn(holding, S_att, F1)
+        loss = self.loss_fn(holding, S_att, F1, VIX)
         if loss.item() > result_best:
             att_best = (budget.unsqueeze(1) * att_sign).clone().detach()
 
@@ -480,23 +504,27 @@ class loss_MSE_VIX(nn.Module):
     Forces the agent to act strictly as a hedger, heavily penalizing 
     ANY deviation (profit or loss) from the option liability.
     """
-    def __init__(self, Strike_price, trans_cost_rate=0.):
+    def __init__(self, Strike_price, trans_cost_rate=0., option_type='call'):
         super(loss_MSE_VIX, self).__init__()
         self.K = Strike_price
         self.tc_rate = trans_cost_rate
         # p0 represents the initial option premium collected
         self.p0 = nn.Parameter(torch.tensor(1.69))
+        self.option_type = option_type.lower()
 
     def terminal_payoff(self, final_price):
+        if self.option_type == 'put':
+            return torch.max(self.K - final_price, torch.zeros_like(final_price))
         return torch.max(final_price - self.K, torch.zeros_like(final_price))
 
     def forward(self, holding, S, F1, VIX):
-        # 1. Price Changes & Structural Roll Yield
+        # 1. Price Changes
         delta_S = S[:, 1:] - S[:, :-1]
-        delta_F1_constant = F1[:, 1:] - F1[:, :-1]
+        delta_F1 = F1[:, 1:] - F1[:, :-1]
         
-        daily_roll_yield = (VIX[:, :-1] - F1[:, :-1]) * (1.0 / 30.0)
-        true_delta_F1 = delta_F1_constant + daily_roll_yield
+        # Assume VIX future expires on the same date as the option
+        true_delta_F1 = delta_F1.clone()
+        true_delta_F1[:, -1] = VIX[:, -1] - F1[:, -2]
         
         delta_price = torch.stack([delta_S, true_delta_F1], dim=-1)
         

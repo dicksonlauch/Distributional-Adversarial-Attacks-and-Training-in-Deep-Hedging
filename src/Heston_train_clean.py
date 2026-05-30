@@ -69,14 +69,16 @@ parser = argparse.ArgumentParser(description="Script for configuring network par
 # Add arguments with default values
 parser.add_argument("--N", type=int, default=10000, help="number of samples.")
 parser.add_argument("--transaction_cost_rate", type=float, default=0.0, help="transaction cost rate.")
+parser.add_argument("--option_type", type=str, default="call", choices=["call", "put"], help="Type of option: call or put.")
 # Parse the arguments
 args = parser.parse_args()
 args_dict = vars(args)
 print(args_dict)
 N = args.N
 transaction_cost_rate = args.transaction_cost_rate
+option_type = args.option_type
 
-name = f"HestonClean_N{N:.0e}_tran{transaction_cost_rate:.0e}".replace("+0", "").replace("-0", "-")
+name = f"HestonClean_{option_type.capitalize()}_N{N:.0e}_tran{transaction_cost_rate:.0e}".replace("+0", "").replace("-0", "-")
 # Load training data
 Heston_data_train = torch.load('../Data/Heston_train.pt')
 # Loop over data partitions
@@ -89,14 +91,14 @@ for part in range(0, int(1e5/N)):
     network = RNN_BN_simple(sequence_length=sequence_length).to(device=device)
     # For Recurrent structure, replace above line by:
     # network = RNN_BN(sequence_length=sequence_length).to(device=device)
-    loss_fn = loss_CVAR(Strike_price=K, vol=sigma, T=T, alpha_loss=alpha_loss, trans_cost_rate=transaction_cost_rate, p0_mode='given').to(device=device)
+    loss_fn = loss_CVAR(Strike_price=K, vol=sigma, T=T, alpha_loss=alpha_loss, trans_cost_rate=transaction_cost_rate, p0_mode='given', option_type=option_type).to(device=device)
     p0_clean = nn.Parameter(torch.tensor(1.69))
     opt = torch.optim.Adam([
         {'params': network.parameters()},  # Model parameters
         {'params': [p0_clean]}  # Trainable variable with its own learning rate
     ], lr=learning_rate)
     LR_scheduler = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda=alpha_learning_rate)
-    attacker = Heston_Attacker(loss_fn=loss_CVAR(Strike_price=K, vol=sigma, T=T, alpha_loss=alpha_loss, trans_cost_rate=transaction_cost_rate, p0_mode='search').to(device=device),
+    attacker = Heston_Attacker(loss_fn=loss_CVAR(Strike_price=K, vol=sigma, T=T, alpha_loss=alpha_loss, trans_cost_rate=transaction_cost_rate, p0_mode='search', option_type=option_type).to(device=device),
                                 s0=s0, v0=v0, alpha=alpha, b=b, sigma=sigma, rho=rho, timestep=sequence_length, T=T)
 
     # Training loop

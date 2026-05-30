@@ -78,15 +78,18 @@ parser.add_argument("--transaction_cost_rate", type=float, default=0.0,
                     help="transaction cost rate.")
 parser.add_argument("--loss_type", type=str, default="mse", choices=["cvar", "entropic", "mse"], 
                     help="Type of loss function to use.")
+parser.add_argument("--option_type", type=str, default="call", choices=["call", "put"], 
+                    help="Type of option: call or put.")
 args = parser.parse_args()
 args_dict = vars(args)
 print(args_dict)
 N = args.N
+option_type = args.option_type
 T = dt * sequence_length
 transaction_cost_rate = args.transaction_cost_rate
 loss_type = args.loss_type
 
-name = f"VIX_HestonClean_{loss_type}_N{N:.0e}_tran{transaction_cost_rate:.0e}".replace("+0", "").replace("-0", "-")
+name = f"VIX_HestonClean_{loss_type}_{option_type.capitalize()}_N{N:.0e}_tran{transaction_cost_rate:.0e}".replace("+0", "").replace("-0", "-")
 
 # Load training data: (S, V, VIX, F1)
 data_train = torch.load('../Data/VIX_Heston_train.pt')
@@ -119,20 +122,23 @@ for part in range(0, int(1e5 / N)):
     if loss_type == "mse":
         loss_fn = loss_MSE_VIX(
             Strike_price=K, 
-            trans_cost_rate=transaction_cost_rate
+            trans_cost_rate=transaction_cost_rate,
+            option_type=option_type
         ).to(device)
         params.append({'params': [loss_fn.p0]})
         
     elif loss_type == "cvar":
         loss_fn = loss_CVAR_VIX(
             Strike_price=K, alpha_loss=alpha_loss,
-            trans_cost_rate=transaction_cost_rate, p0_mode='given'
+            trans_cost_rate=transaction_cost_rate, p0_mode='given',
+            option_type=option_type
         ).to(device) 
         params.append({'params': [p0_clean]})
         
     elif loss_type == "entropic":
         loss_fn = loss_Entropic_VIX(
-            Strike_price=K, trans_cost_rate=transaction_cost_rate
+            Strike_price=K, trans_cost_rate=transaction_cost_rate,
+            option_type=option_type
         ).to(device)
         # Entropic does not optimize p0
 

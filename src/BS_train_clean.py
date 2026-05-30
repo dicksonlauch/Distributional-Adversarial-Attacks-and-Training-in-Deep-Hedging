@@ -67,13 +67,15 @@ parser = argparse.ArgumentParser(description="Script for configuring network par
 
 # Add arguments with default values
 parser.add_argument("--N", type=int, default=10000, help="number of samples.")
+parser.add_argument("--option_type", type=str, default="call", choices=["call", "put"], help="Type of option: call or put.")
 args = parser.parse_args()
 args_dict = vars(args)
 print(args_dict)
 N = args.N
+option_type = args.option_type
 
 # Define the name for saving the model
-name = f"BSClean_N{N:.0e}".replace("+0", "").replace("-0", "-")
+name = f"BSClean_{option_type.capitalize()}_N{N:.0e}".replace("+0", "").replace("-0", "-")
 
 # Load the training data
 price_train = torch.load('../Data/BS_train.pt')
@@ -86,7 +88,7 @@ for part in range(0, int(1e5/N)):
     train_loader = torch.utils.data.DataLoader(train_data, batch_size=batch_size, shuffle=True)
     # Initialize network and loss function
     network = RNN_BN_simple(1,sequence_length,device).to(device)
-    loss_fn = loss_exp_OCE(K, sigma, T,1.3,X_max=True, p0_mode='given').to(device)
+    loss_fn = loss_exp_OCE(K, sigma, T,1.3,X_max=True, p0_mode='given', option_type=option_type).to(device)
     # Setup Trainable parameters and optimizer
     p0_clean = nn.Parameter(torch.tensor(1.69))
     opt = torch.optim.Adam([

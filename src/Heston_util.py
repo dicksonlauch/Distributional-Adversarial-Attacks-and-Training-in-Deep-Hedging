@@ -421,6 +421,7 @@ class loss_CVAR(nn.Module):
                  alpha_loss,
                  p0_mode = 'search',
                  trans_cost_rate=0.,
+                 option_type='call',
                  ):
         super(loss_CVAR, self).__init__()
         self.K = Strike_price
@@ -433,8 +434,11 @@ class loss_CVAR(nn.Module):
             self.p0 = 1.96
         self.p0_mode = p0_mode
         self.transaction_cost_rate = trans_cost_rate
+        self.option_type = option_type.lower()
     
     def terminal_payoff(self, final_price):
+        if self.option_type == 'put':
+            return torch.max(self.K - final_price, torch.zeros_like(final_price))
         return torch.max(final_price - self.K, torch.zeros_like(final_price))
 
     def forward(self,
